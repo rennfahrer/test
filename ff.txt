@@ -1,0 +1,507 @@
+/*####################################	###############################################################
+*
+* Created By    	     : Mani 
+*
+* Date created  		 : 05-Oct-2023 
+*
+* JIRA					 : FSGDP-1138
+*
+* Revision History		 
+----------------------------------------------------------------------------------------------------- 
+  Date            Author           Change log
+----------------------------------------------------------------------------------------------------- 
+
+#####################################################################################################*/
+
+-- Description: This stored procedure establishes a link between Release and Withdraw, Release and Reverse Release, Release and Document Clearing, Release and Commission Adjustment through FIFO logic.
+ 
+-- Parameter Definitions:
+-- @in_asset_type: The asset Type of the process.
+-- @in_assetId_from: The start value of the asset Id batch.
+-- @in_assetId_to: The end value of the asset Id batch.
+-- @in_load_mode: Indicates whether it is a Full load or a Delta Load.
+-- @in_date_from: The start date of the transactions.
+-- @in_date_to: The end date of the transactions.
+-- @in_no_of_days: The number of days before the transactions need to be picked up.
+-- @in_payoutMethod: Indicates whether it is a Bank Transfer or Stripe.
+ 
+PROCEDURE "hdw_payments.bal.procedures::sp_bt_fifo"( 	
+	 IN	in_asset_type NVARCHAR(60)
+	,IN in_assetId_from NVARCHAR(60)
+    ,IN in_assetId_to NVARCHAR(60)
+	,IN in_load_mode CHAR(1) 
+	,IN in_payoutMethod NVARCHAR(100)
+	,IN in_date_from DATE
+	,IN in_date_to DATE 
+	
+)
+   LANGUAGE SQLSCRIPT
+   SQL SECURITY INVOKER
+   AS
+BEGIN
+   -- Initialization
+  DECLARE i, lv_max_group INTEGER;
+  DECLARE lt_transactions,lt_commission_transactions "hdw_payments.bal.data.types::TT_BT_FIFO_TRANSACTIONS_COMMISSION";
+  DECLARE lt_credit_debit_balances "hdw_payments.bal.data.types::TT_BT_FIFO_COMM_CLEARING_BAL";
+  DECLARE lt_commission_clearing_balances "hdw_payments.bal.data.types::TT_BT_FIFO_COMM_CLEARING_BAL"; 
+  --DECLARE in_date_from,in_date_to DATE := ADD_DAYS(CURRENT_DATE, -1);
+--DECLARE in_date_from DATE;
+
+
+IF(:in_load_mode = 'F') THEN  
+    -- Cleanup  
+    in_date_from := '1000-01-01';   
+
+    in_date_to = ADD_DAYS(CURRENT_DATE, -1);
+    
+    DELETE FROM "hdw_payments.bal.data::cdsFIFO.transactions" 
+    WHERE "assetType" = :in_asset_type 
+    AND TO_BIGINT('0' || SUBSTR_REGEXPR('^[0-9]*$' IN "assetId")) BETWEEN :in_assetId_from AND :in_assetId_to
+    AND TO_DATE("debitTransactionDate") BETWEEN :in_date_from AND :in_date_to
+    AND "payoutMethod" = :in_payoutMethod ;
+    
+    DELETE FROM "hdw_payments.bal.data::cdsFIFO.balance"
+    WHERE "assetType" = :in_asset_type 
+    AND TO_BIGINT('0' || SUBSTR_REGEXPR('^[0-9]*$' IN "assetId")) BETWEEN :in_assetId_from AND :in_assetId_to
+    AND TO_DATE("transactionDate") BETWEEN :in_date_from AND :in_date_to
+    AND "payoutMethod" = :in_payoutMethod ;
+    
+    DELETE FROM "hdw_payments.bal.data::cdsFIFO.commissionTransactions" 
+    WHERE "assetType" = :in_asset_type 
+    AND TO_BIGINT('0' || SUBSTR_REGEXPR('^[0-9]*$' IN "assetId")) BETWEEN :in_assetId_from AND :in_assetId_to
+    AND TO_DATE("debitTransactionDate") BETWEEN :in_date_from AND :in_date_to
+    AND "payoutMethod" = :in_payoutMethod ;
+
+   COMMIT;
+  ELSE 
+  
+  IF in_date_from = '1000-01-01'  THEN   
+
+    SELECT IFNULL(MAX("runDate"),'2019-01-01') INTO in_date_from 
+    FROM ( 
+    		SELECT MAX("runDate") as "runDate"
+		    FROM "hdw_payments.bal.data::cdsFIFO.transactions"
+		    WHERE "assetType" = :in_asset_type
+		    AND "payoutMethod" = :in_payoutMethod 
+		    AND TO_BIGINT('0' || SUBSTR_REGEXPR('^[0-9]*$' IN "assetId")) BETWEEN :in_assetId_from AND :in_assetId_to
+		    UNION 
+		    SELECT MAX("runDate") 
+		    FROM "hdw_payments.bal.data::cdsFIFO.balance"
+		    WHERE "assetType" = :in_asset_type
+		    AND "payoutMethod" = :in_payoutMethod 
+		    AND TO_BIGINT('0' || SUBSTR_REGEXPR('^[0-9]*$' IN "assetId")) BETWEEN :in_assetId_from AND :in_assetId_to
+		  ); 
+	
+	ELSE  
+	  
+	--Do nothing   
+	  
+	END IF;  
+	  
+
+		  
+	in_date_to = :in_date_to;
+  
+  END IF;
+  
+  
+  /*************************************************************************************************/
+  /* Commission Liability */
+  /*************************************************************************************************/
+  CALL "hdw_payments.bal.procedures::sp_bt_fifo_commission"(
+    :in_asset_type,
+    :in_assetId_from,
+    :in_assetId_to,
+    :in_load_mode, 
+    :in_date_from,
+    :in_date_to,
+    :in_payoutMethod,
+    :lt_commission_clearing_balances,
+    :lt_commission_transactions
+  );
+
+  /*************************************************************************************************/
+  /* Release Liability */
+  /*************************************************************************************************/
+
+  /***** Add Withdraw, Reverse Withdraw, Reverse Release, Debit Notes to Debit Balance ****/
+  INSERT INTO :lt_credit_debit_balances
+  SELECT *,:in_payoutMethod as "payoutMethod"
+  FROM "hdw_payments.bal.functions::TF_BT_FIFO_CREDIT_DEBIT_BAL"(
+    :in_asset_type,
+    :in_assetId_from,
+    :in_assetId_to,
+    :in_load_mode,
+    :in_date_from,
+    :in_date_to, 
+    :in_payoutMethod,
+    :lt_commission_clearing_balances,
+    :lt_commission_transactions
+  );
+  
+  if( :in_load_mode = 'D' )
+   then
+      DELETE FROM "hdw_payments.bal.data::cdsFIFO.balance"
+      WHERE "assetType" = :in_asset_type 
+       AND TO_BIGINT('0' || SUBSTR_REGEXPR('^[0-9]*$' IN "assetId")) BETWEEN :in_assetId_from AND :in_assetId_to
+       AND "balanceType"='P'
+       AND "payoutMethod" = :in_payoutMethod 
+       ;
+  end if;
+  
+  SELECT MAX("gr") INTO lv_max_group FROM :lt_credit_debit_balances;
+
+  FOR i IN 0..:lv_max_group DO
+   
+    lt_deb_rel = SELECT
+                  *,
+                  IFNULL(LAG("to") OVER (PARTITION BY "assetType", "assetId", "transactionCurrency" ORDER BY "transactionDate", "to"), 0) AS "from",
+                  IFNULL(LAG("pidto") OVER (PARTITION BY "assetType", "assetId", "transactionCurrency", "purchaseItemId" ORDER BY "transactionDate", "pidto"), 0) AS "pidfrom"
+                FROM (
+                  SELECT *,
+                    SUM("transactionAmount") OVER (PARTITION BY "assetId", "assetType", "transactionCurrency" ORDER BY "transactionDate", "transactionId" ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS "to",
+                    SUM("transactionAmount") OVER (PARTITION BY "assetId", "assetType", "transactionCurrency", "purchaseItemId" ORDER BY "transactionDate", "transactionId" ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS "pidto"
+                  FROM :lt_credit_debit_balances
+                  WHERE "gr" = :i AND "debCreInd" = 'D'
+                );
+	 
+	  	/*********** Update Credit Balance ********/
+ 
+	     UPDATE :lt_credit_debit_balances AS balance
+	    		SET "transactionAmount" = "transactionAmount"+"debitTransactionAmount"
+	    FROM :lt_credit_debit_balances AS balance, (SELECT  a."purchaseItemId","creditTransactionType","creditTransactionId",SUM("debitTransactionAmount" ) as "debitTransactionAmount"
+	    											FROM :lt_transactions a INNER JOIN :lt_deb_rel b 
+	    													ON a."debitTransactionId"=b."transactionId" and b."transactionType"='RW'
+	    											GROUP BY a."purchaseItemId","creditTransactionType","creditTransactionId"
+	    ) AS trans  
+	    WHERE balance."transactionId" = trans."creditTransactionId"
+	      AND balance."transactionType" = trans."creditTransactionType"
+	      AND (balance."purchaseItemId"=trans."purchaseItemId" OR trans."purchaseItemId" IS NULL)
+	     ;
+     
+    lt_cre_rel = SELECT
+                  *,
+                  IFNULL(LAG("to") OVER (PARTITION BY "assetType", "assetId", "transactionCurrency" ORDER BY "transactionDate", "to"), 0) AS "from",
+                  IFNULL(LAG("pidto") OVER (PARTITION BY "assetType", "assetId", "transactionCurrency", "purchaseItemId" ORDER BY "transactionDate", "pidto"), 0) AS "pidfrom"
+                FROM
+                (
+                  SELECT
+                    c.*,
+                    SUM("transactionAmount") OVER (PARTITION BY c."assetId", c."assetType", c."transactionCurrency" ORDER BY c."transactionDate", c."transactionId" ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS "to",
+                    SUM("transactionAmount") OVER (PARTITION BY c."assetId", c."assetType", c."transactionCurrency", "purchaseItemId" ORDER BY c."transactionDate", c."transactionId" ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS "pidto"
+                  FROM
+                    :lt_credit_debit_balances AS c
+                    INNER JOIN
+                    (
+                      SELECT
+                        "assetId",
+                        "assetType",
+                        "transactionCurrency",
+                        MAX("transactionDate") AS "transactionDate",
+                        MAX("transactionType") AS "transactionType"
+                      FROM
+                        :lt_deb_rel
+                      GROUP BY
+                        "assetId",
+                        "assetType",
+                        "transactionCurrency"
+                    ) AS d
+                    ON
+                      d."assetId" = c."assetId"
+                      AND d."assetType" = c."assetType"
+                      AND d."transactionCurrency" = c."transactionCurrency"
+                      AND (
+                            (c."transactionType" = 'CRE' AND d."transactionType" IN ('DEB', 'INV') AND c."transactionDate" <= ADD_SECONDS(d."transactionDate", 60))
+                            OR (c."transactionType" = 'CRE' AND d."transactionType" NOT IN ('DEB', 'INV') AND c."transactionDate" <= d."transactionDate")
+                            OR (c."transactionType" <> 'CRE' AND c."transactionDate" <= d."transactionDate")
+                          )
+                  WHERE c."transactionAmount" > 0 AND "debCreInd" = 'C'
+                );
+
+    lt_trans_rel = SELECT
+                    -- SAP-62993 Changed from lt_trans to lt_trans_rel
+                    c.*,
+                    d."runDate" AS "debitRunDate", 
+                    d."assetId" AS "debitassetId",
+                    d."assetType" AS "debitassetType",
+                    d."transactionCurrency" AS "debitTransactionCurrency",
+                    d."purchaseId" AS "debitPurchaseId",
+                    d."purchaseItemId" AS "debitPurchaseItemId",
+                    d."transactionId" AS "debitTransactionId",
+                    d."transactionType" AS "debitTransactionType",
+                    d."transactionDate" AS "debitTransactionDate",
+                    d."from" AS "debitFrom",
+                    d."to" AS "debitTo",
+                    CASE
+                        WHEN d."transactionType" = 'RR' AND d."releaseId" = '' THEN 
+                        	case 
+                              when c."transactionDate" IS NULL
+                               then  d."transactionAmount"
+                              else
+                             	 least(ifnull(c."transactionAmount",99999999), least(ifnull(c."pidto",0), d."pidto") - greatest(ifnull(c."pidfrom",0), d."pidfrom")) 
+                              end   
+                        WHEN d."transactionType" = 'RR' AND d."releaseId" <> '' THEN
+                            d."transactionAmount"
+                        ELSE
+                            LEAST(c."transactionAmount", LEAST(c."to", d."to") - GREATEST(c."from", d."from"))
+                    END AS "debitTransactionAmount",
+                    CASE
+                        WHEN d."transactionType" = 'RR' AND d."releaseId" = '' AND c."pidto"  > d."pidto" THEN
+                             c."pidto" - d."pidto"
+                        WHEN d."transactionType" = 'RR' AND d."releaseId" <> '' THEN
+                             c."transactionAmount" - d."transactionAmount"
+                        WHEN d."transactionType" = 'RR' AND d."pidto" IS NULL THEN
+                            c."transactionAmount"
+                        WHEN d."transactionType" <> 'RR' AND c."to" > d."to" THEN
+                            c."to" - d."to"
+                        WHEN d."transactionType" <> 'RR' AND d."to" IS NULL THEN
+                            c."transactionAmount"
+                        ELSE 0
+                    END AS "creditTransactionBalance",
+                    CASE
+                        WHEN d."transactionType" = 'RR' AND d."releaseId" = '' AND d."pidto" > ifnull(c."pidto",0) THEN
+                            case when c."pidto" is null then 0  
+                                 else d."pidto" - c."pidto"
+                            end
+                        WHEN d."transactionType" = 'RR' AND d."releaseId" <> '' THEN
+                            0
+                        WHEN d."transactionType" = 'RR' AND c."pidto" IS NULL THEN
+                            d."transactionAmount"
+                        WHEN d."transactionType" <> 'RR' AND d."to" > c."to" THEN
+                            d."to" - c."to"
+                        WHEN d."transactionType" <> 'RR' AND c."to" IS NULL THEN
+                            d."transactionAmount"
+                        ELSE 0
+                    END AS "debitTransactionBalance",
+                    ROW_NUMBER() OVER (PARTITION BY c."transactionId", c."purchaseItemId" ORDER BY d."transactionDate" DESC, d."to" DESC) cre_rn,
+                    ROW_NUMBER() OVER (PARTITION BY d."transactionId", d."transactionCurrency",d."transactionType" ORDER BY c."transactionDate" DESC, c."to" DESC) deb_rn, -- SAP-64350
+                    CASE
+                        WHEN c."transactionType" = 'CRE' THEN c."loadDate_inv"
+                        ELSE d."loadDate_inv"
+                    END AS "debitloadDate_inv",
+                    d."loadDate_rr" AS "debitloadDate_rr",
+                    d."loadDate_w" AS "debitloadDate_w",
+                    CASE
+                        WHEN c."transactionType" = 'CRE' THEN c."hashKey_inv"
+                        ELSE d."hashKey_inv"
+                    END AS "debithashKey_inv",
+                    d."hashKey_rr" AS "debithashKey_rr",
+                    d."hashKey_w" AS "debithashKey_w"
+                  FROM :lt_deb_rel AS d
+                        FULL OUTER JOIN :lt_cre_rel AS c
+                            ON d."assetId" = c."assetId"
+                            AND d."assetType" = c."assetType"
+                            AND d."transactionCurrency" = c."transactionCurrency"
+                            AND (
+	                                (c."from" < d."to" AND c."to" > d."from"
+	                                	AND d."transactionType" IN ('W', 'DEB', 'INV') 
+	                                	AND (
+											    (c."transactionType" = 'CRE' AND d."transactionType" IN ('DEB', 'INV') AND c."transactionDate" <= ADD_SECONDS(d."transactionDate", 60))
+												    OR (c."transactionType" = 'CRE' AND d."transactionType" NOT IN ('DEB', 'INV') AND c."transactionDate" <= d."transactionDate")
+												    OR (c."transactionType" <> 'CRE' AND c."transactionDate" <= d."transactionDate") 
+								    ))
+	                                OR
+	                                (d."transactionType" = 'RR' AND c."purchaseItemId" = d."purchaseItemId" AND d."releaseId" = '' AND c."pidfrom" < d."pidto" AND c."pidto" > d."pidfrom")
+	                                OR
+	                                (d."transactionType" = 'RR' AND d."releaseId" = c."transactionId")
+                            	)
+                        WHERE (c."transactionId" IS NOT NULL AND d."transactionId" IS NOT NULL) OR d."transactionType"='RR';
+  
+    /*********** Update Credit Balance ********/
+    UPDATE :lt_credit_debit_balances AS balance
+    SET "transactionAmount" = "creditTransactionBalance"
+    FROM :lt_credit_debit_balances AS balance, :lt_trans_rel AS trans -- SAP-62993 Changed from lt_trans to lt_trans_rel
+    WHERE balance."transactionId" = trans."transactionId"
+      AND balance."transactionType" = trans."transactionType"
+      AND (
+        (balance."purchaseItemId" = trans."purchaseItemId" AND balance."transactionType" <> 'CRE')
+        OR balance."transactionType" = 'CRE'
+      )
+      AND trans.cre_rn = 1
+      AND balance."debCreInd" = 'C';
+  
+    /*********** Update Debit Balance ********/
+    UPDATE :lt_credit_debit_balances AS balance
+    SET "transactionAmount" = trans."debitTransactionBalance"
+    FROM :lt_credit_debit_balances AS balance, :lt_trans_rel AS trans -- SAP-62993 Changed from lt_trans to lt_trans_rel
+    WHERE balance."transactionId" = trans."debitTransactionId"
+      AND balance."transactionType" = trans."debitTransactionType"
+      AND balance."transactionCurrency" = trans."debitTransactionCurrency" -- SAP-64350 Added
+      AND trans.deb_rn = 1
+      AND balance."debCreInd" = 'D';
+    
+    INSERT INTO :lt_transactions
+    (
+      SELECT
+        IFNULL("runDate","debitRunDate"),
+        IFNULL("assetId","debitassetId"),
+        IFNULL("assetType","debitassetType"),
+        IFNULL("purchaseId","debitPurchaseId") ,
+        IFNULL("purchaseItemId","debitPurchaseItemId"), 
+        "transactionId" AS "creditTransactionId",
+        "transactionType" AS "creditTransactionType",
+        "transactionDate" AS "creditTransactionDate",
+        "transactionAmount" AS "creditTransactionAmount",
+        "debitTransactionId",
+        "debitTransactionType",
+        "debitTransactionDate",
+        "debitTransactionAmount",
+        IFNULL("transactionCurrency","debitTransactionCurrency"), 
+        "debithashKey_w",
+        "hashKey_r",
+        "debithashKey_rr",
+        "debithashKey_inv",
+        "hashKey_adj",
+        "debitloadDate_w",
+        "loadDate_r",
+        "debitloadDate_rr",
+        "debitloadDate_inv",
+        "loadDate_adj",:in_payoutMethod as "payoutMethod"
+      FROM :lt_trans_rel
+    );
+  END FOR;
+   
+  /*********** Credit/Debit Balance ********/
+  INSERT INTO  "hdw_payments.bal.data::cdsFIFO.balance" -- ADD PSPNAME
+  (
+    "runDate",
+    "transactionId",
+    "releaseId",
+    "hashKey",
+    "assetId",
+    "assetType",
+    "purchaseId",
+    "purchaseItemId",
+    "data_mart_name",
+    "transactionDate",
+    "transactionAmount",
+    "transactionCurrency",
+    "loadDate",
+	"balanceType",
+	"payoutMethod"
+  )
+  SELECT
+    "runDate",
+    "transactionId",
+    "releaseId",
+    CASE
+      WHEN "debCreInd" = 'C' AND "transactionType" = 'R' THEN "hashKey_r"
+      WHEN "debCreInd" = 'C' AND "transactionType" IN ('CRE', 'AINV') THEN "hashKey_inv"
+      WHEN "debCreInd" = 'C' AND "transactionType" = 'ADJ' THEN "hashKey_adj"
+      WHEN "debCreInd" = 'D' AND "transactionType" = 'W' THEN "hashKey_w" -- IN ('W','RW')
+      WHEN "debCreInd" = 'D' AND "transactionType" IN ('DEB', 'INV') THEN "hashKey_inv"
+      WHEN "debCreInd" = 'D' AND "transactionType" = 'RR' THEN "hashKey_rr"
+    END AS "hashKey",
+    "assetId",
+    "assetType",
+    "purchaseId",
+    "purchaseItemId",
+    "transactionType",
+    "transactionDate",
+    "transactionAmount",
+    "transactionCurrency",
+    CASE
+      WHEN "debCreInd" = 'C' AND "transactionType" = 'R' THEN "loadDate_r"
+      WHEN "debCreInd" = 'C' AND "transactionType" IN ('CRE', 'AINV') THEN "loadDate_inv"
+      WHEN "debCreInd" = 'C' AND "transactionType" = 'ADJ' THEN "loadDate_adj"
+      WHEN "debCreInd" = 'D' AND "transactionType" = 'W' THEN "loadDate_w" -- IN ('W','RW')
+      WHEN "debCreInd" = 'D' AND "transactionType" IN ('DEB', 'INV') THEN "loadDate_inv"
+      WHEN "debCreInd" = 'D' AND "transactionType" = 'RR' THEN "loadDate_rr"
+    END AS "loadDate",
+    'P' as "balanceType",
+    :in_payoutMethod
+  FROM :lt_credit_debit_balances
+  WHERE "debCreInd" IN ('C', 'D')
+  and "transactionAmount" !=0
+  and "transactionType" NOT IN ( 'RR','RW');
+  
+  /*********** Transactions ********/
+  
+ INSERT INTO "hdw_payments.bal.data::cdsFIFO.transactions"
+	(
+	    "runDate",
+	    "assetId",
+	    "assetType",
+	    "purchaseId",
+	    "purchaseItemId",
+	    "creditTransactionId",
+	    "creditTransactionType",
+	    "creditTransactionDate",
+	    "creditTransactionAmount",
+	    "debitTransactionId",
+	    "debitTransactionType",
+	    "debitTransactionDate",
+	    "debitTransactionAmount",
+	    "transactionCurrency",
+	    "hashKey_w",
+	    "hashKey_r",
+	    "hashKey_rr",
+	    "hashKey_inv",
+	    "hashKey_adj",
+	    "loadDate_w",
+	    "loadDate_r",
+	    "loadDate_rr",
+	    "loadDate_inv",
+	    "loadDate_adj",
+	    "payoutMethod"
+	)
+	(
+	    SELECT
+	        "runDate",
+	        "assetId",
+	        "assetType",
+	        "purchaseId",
+	        "purchaseItemId",
+	        "creditTransactionId",
+	        "creditTransactionType",
+	        "creditTransactionDate",
+	        "creditTransactionAmount",
+	        "debitTransactionId",
+	        "debitTransactionType",
+	        "debitTransactionDate",
+	        "debitTransactionAmount",
+	        "transactionCurrency",
+	        "hashKey_w",
+	        "hashKey_r",
+	        "hashKey_rr",
+	        "hashKey_inv",
+	        "hashKey_adj",
+	        "loadDate_w",
+	        "loadDate_r",
+	        "loadDate_rr",
+	        "loadDate_inv",
+	        "loadDate_adj",
+	        :in_payoutMethod
+	    FROM :lt_transactions
+	    UNION ALL
+		SELECT "runDate"
+			  , "assetId"
+			  , "assetType"
+			  , "purchaseId"
+			  , "purchaseItemId"
+			  , "releaseId"						AS "creditTransactionId"
+			  , NULL							AS "creditTransactionType"
+			  , NULL							AS "creditTransactionDate"
+			  , NULL							AS "creditTransactionAmount" 
+			  , "transactionId"					AS "debitTransactionId"
+			  , "transactionType"				AS "debitTransactionType"
+			  , "transactionDate"				AS "debitTransactionDate"
+			  , "transactionAmount" 			AS "debitTransactionAmount"
+			  , "transactionCurrency"  
+		      , NULL							AS "hashKey_w"
+			  , NULL							AS "hashKey_r"              
+			  , "hashKey_rr"             
+			  , NULL							AS "hashKey_inv"            
+			  , NULL							AS "hashKey_adj"           
+			  , NULL							AS "loadDate_w"       
+	          , NULL							AS "loadDate_r"           
+	    	  , "loadDate_rr"          
+	          , NULL							AS "loadDate_inv"          
+	    	  , NULL							AS "loadDate_adj" 
+	    	  , :in_payoutMethod
+		 FROM :lt_credit_debit_balances
+	     WHERE "transactionType"='RR'
+	       and "transactionAmount" !=0
+	);
+COMMIT;
+END;
